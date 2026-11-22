@@ -139,9 +139,23 @@ from app.modules import 段序放行戳 as 戳
 
 @路由.get("/贯验/段序戳")
 def 取段序戳(批号: str | None = None):
+    """只读：放行戳投影（批号、原序、执行序、拓扑版本、结果/拒绝原因）。"""
     conn = 连接()
     try:
         return 戳.查戳(conn, 批号)
+    finally:
+        conn.close()
+
+
+@路由.get("/贯验/段序戳/核证")
+def 段序戳核证(批号: str | None = None):
+    """只读段序戳核证（基线所无）：戳投影 × 序审计 × 三表当前三方互证。"""
+    conn = 连接()
+    try:
+        报 = 戳.核证(conn)
+        if 批号:
+            报["批号过滤"] = [x for x in 报["批号核证"] if x["批号"] == 批号]
+        return 报
     finally:
         conn.close()
 

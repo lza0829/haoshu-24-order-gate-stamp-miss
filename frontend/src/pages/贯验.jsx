@@ -56,6 +56,34 @@ export default function 贯验(){
         </div>
       </div>
 
+      {末.段序戳核证 && (
+        <div className="段">
+          <div className="段题">
+            段序放行戳核证 · 口径 {末.段序戳核证.口径}
+            <span className={`徽章 ${末.段序戳核证.是否通过?"通":"败"}`} style={{marginLeft:"0.5rem"}}>
+              {末.段序戳核证.是否通过?"通过":"未过"}
+            </span>
+          </div>
+          {末.段序戳核证.异常?.length>0 && (
+            <pre className="码">{末.段序戳核证.异常.join("\n")}</pre>
+          )}
+          <table>
+            <thead><tr><th>批号</th><th>有戳</th><th>戳结果</th><th>续装前置</th><th>核证</th></tr></thead>
+            <tbody>
+              {末.段序戳核证.批号核证?.map(b=>(
+                <tr key={b.批号}>
+                  <td>{b.批号}</td>
+                  <td>{b.有戳?"✓":"✗"}</td>
+                  <td>{b.戳结果||"—"}</td>
+                  <td>{b.续装前置?"满足":"不满足"}</td>
+                  <td><span className={`徽章 ${b.核证通过?"通":"败"}`}>{b.核证通过?"通过":"未过"}</span></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
       {末.检项?.length>0 && (
         <div className="段">
           <div className="段题">本轮检项</div>

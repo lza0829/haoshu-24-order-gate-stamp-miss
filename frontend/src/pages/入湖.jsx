@@ -39,6 +39,9 @@ export default function 入湖(){
       <button className="次" onClick={()=>灌("序闸-甲-缺枢纽")} disabled={!!忙}>
         {忙==="序闸-甲-缺枢纽"?"灌入中…":"灌入序闸甲（缺枢纽）"}
       </button>
+      <button className="次" onClick={()=>灌("序闸-丙-续装补段")} disabled={!!忙}>
+        {忙==="序闸-丙-续装补段"?"灌入中…":"灌入序闸丙（凭戳续装补段）"}
+      </button>
     </div>
 
     {!报 && <div className="空态">尚未装载。先灌样例，再到枢纽 / 链接 / 卫星查看落库。</div>}

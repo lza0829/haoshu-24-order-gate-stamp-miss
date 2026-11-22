@@ -6,13 +6,15 @@ from app.db import 夹具目录, 连接
 建表 = """
 CREATE TABLE IF NOT EXISTS 段序放行戳 (
   编号 INTEGER PRIMARY KEY AUTOINCREMENT,
-  批号 TEXT NOT NULL,
+  批号 TEXT NOT NULL UNIQUE,
   原序 TEXT NOT NULL DEFAULT '[]',
   执行序 TEXT NOT NULL DEFAULT '[]',
   拓扑版本 TEXT NOT NULL DEFAULT '',
+  结果 TEXT NOT NULL DEFAULT '',
   拒绝原因 TEXT NOT NULL DEFAULT '',
   时刻 TEXT NOT NULL DEFAULT ''
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_段序戳_批号 ON 段序放行戳(批号);
 
 CREATE TABLE IF NOT EXISTS 站规 (
   键 TEXT PRIMARY KEY,
@@ -130,9 +132,20 @@ def 载荷哈希(obj) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
 
 
+def _迁移段序戳(conn) -> None:
+    """对已存在的旧库补列、补唯一索引，保证放行戳表满足新口径。"""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(段序放行戳)")}
+    if "结果" not in cols:
+        conn.execute("ALTER TABLE 段序放行戳 ADD COLUMN 结果 TEXT NOT NULL DEFAULT ''")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_段序戳_批号 ON 段序放行戳(批号)"
+    )
+
+
 def 初始化库() -> None:
     conn = 连接()
     conn.executescript(建表)
+    _迁移段序戳(conn)
     if conn.execute("SELECT COUNT(*) AS c FROM 站规").fetchone()["c"] == 0:
         for k, v in {"站名": "号枢", "默认装载日": "2026-11-21"}.items():
             conn.execute("INSERT INTO 站规(键, 值) VALUES (?, ?)", (k, v))

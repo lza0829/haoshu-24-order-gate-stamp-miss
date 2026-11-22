@@ -3,7 +3,7 @@ import uuid
 from typing import Any
 
 from app.db import 连接
-from app.modules import 装载序闸
+from app.modules import 装载序闸, 段序放行戳 as 戳
 from app.seed import 哈希键, 载荷哈希, 此刻
 
 
@@ -202,45 +202,52 @@ def 列序审计(批次编号: str = "", 限: int = 50) -> list[dict]:
         conn.close()
 
 
+def _落拒绝(批号: str, 装载日: str, 序: dict, 原因: str, 体: dict | None = None) -> None:
+    """拒绝路径：序审计 + 隔离匣 + 拒绝戳同一事务同成败落下。
+
+    硬约束——序闸拒绝成功也必须有戳，禁止「闸有结论而戳空」。
+    """
+    conn = 连接()
+    try:
+        _记序审计(conn, 批号, 装载日, 序, "拒绝", 原因, 0)
+        conn.execute(
+            "INSERT INTO 隔离匣(原因, 载荷, 时刻) VALUES (?,?,?)",
+            (
+                f"装载序闸: {原因}",
+                json.dumps(体, ensure_ascii=False)[:2000] if 体 is not None else "",
+                此刻(),
+            ),
+        )
+        if not conn.execute("SELECT 1 FROM 段序放行戳 WHERE 批号=?", (批号,)).fetchone():
+            戳.落戳(conn, 批号, 序, 戳.拒绝, 原因)
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def 装一批(体: dict[str, Any]) -> dict[str, Any]:
     """按依赖拓扑重排后装载：枢纽 → 链接 → 卫星。失败整批回滚。
 
-    全局唯一口径：允许载荷乱序声明，按依赖拓扑排序执行；原序与执行序
-    必须留审计。真循环/未知段/重复段/缺依赖才失败闭。
+    全局唯一口径（甲：以放行戳续装为准）：允许载荷乱序声明，按依赖拓扑
+    排序执行；原序与执行序必须留审计，且放行/拒绝与段序放行戳同成败。
+    续装/补段（载荷带「续装批号」）写闸先与戳互证：缺戳或原序/执行序空
+    一律拒绝，即使三表已有本批对象。真循环/未知段/重复段/缺依赖/无戳
+    续装均失败闭、零增量。
     """
     装载日 = str(体.get("装载日") or "").strip()
     批号 = str(体.get("批次编号") or f"批-{uuid.uuid4().hex[:10]}")
+    续装批号 = str(体.get("续装批号") or "").strip()
     if not 装载日:
-        conn = 连接()
-        try:
-            _记序审计(conn, 批号, "", {"原序": [], "执行序": [], "是否重排": False}, "拒绝", "缺装载日", 0)
-            conn.commit()
-        finally:
-            conn.close()
+        空序 = {"原序": [], "执行序": [], "是否重排": False}
+        _落拒绝(批号, "", 空序, "缺装载日", 体)
         return {"结果": "拒绝", "批次编号": 批号, "说明": "缺装载日"}
 
     try:
         序 = 装载序闸.裁定(体)
     except 装载序闸.序闸拒绝 as e:
-        conn = 连接()
-        try:
-            _记序审计(
-                conn,
-                批号,
-                装载日,
-                {"原序": e.原序, "执行序": [], "是否重排": False},
-                "拒绝",
-                e.原因,
-                0,
-            )
-            conn.execute(
-                "INSERT INTO 隔离匣(原因, 载荷, 时刻) VALUES (?,?,?)",
-                (f"装载序闸: {e.原因}", json.dumps(体, ensure_ascii=False)[:2000], 此刻()),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-        return {"结果": "拒绝", "批次编号": 批号, "说明": e.原因, "装载序": {"原序": e.原序, "执行序": []}}
+        拒序 = {"原序": e.原序, "执行序": [], "是否重排": False}
+        _落拒绝(批号, 装载日, 拒序, e.原因, 体)
+        return {"结果": "拒绝", "批次编号": 批号, "说明": e.原因, "装载序": 拒序}
 
     conn = 连接()
     报: dict[str, Any] = {}
@@ -248,39 +255,95 @@ def 装一批(体: dict[str, Any]) -> dict[str, Any]:
     新建 = {"枢纽": [], "链接": [], "卫星": []}
     try:
         if conn.execute("SELECT 1 FROM 装载批次 WHERE 编号=?", (批号,)).fetchone():
-            _记序审计(conn, 批号, 装载日, 序, "拒绝", "批次编号已存在", 0)
+            原因 = "批次编号已存在"
+            _记序审计(conn, 批号, 装载日, 序, "拒绝", 原因, 0)
+            if not conn.execute(
+                "SELECT 1 FROM 段序放行戳 WHERE 批号=?", (批号,)
+            ).fetchone():
+                戳.落戳(conn, 批号, 序, 戳.拒绝, 原因)
             conn.commit()
-            return {"结果": "拒绝", "批次编号": 批号, "说明": "批次编号已存在", "装载序": 序}
+            return {"结果": "拒绝", "批次编号": 批号, "说明": 原因, "装载序": 序}
+
+        # 续装/补段写闸：与放行戳互证。口径甲下缺戳即拒绝，零增量。
+        if 续装批号:
+            前置 = 戳.续装前置(conn, 续装批号)
+            if not 前置["满足"]:
+                原因 = f"续装前置不满足（{续装批号}）：{前置['原因']}"
+                _记序审计(conn, 批号, 装载日, 序, "拒绝", 原因, 0)
+                conn.execute(
+                    "INSERT INTO 隔离匣(原因, 载荷, 时刻) VALUES (?,?,?)",
+                    (原因, json.dumps(体, ensure_ascii=False)[:2000], 此刻()),
+                )
+                戳.落戳(conn, 批号, 序, 戳.拒绝, 原因)
+                conn.commit()
+                return {
+                    "结果": "拒绝",
+                    "批次编号": 批号,
+                    "说明": 原因,
+                    "装载序": 序,
+                    "续装前置": 前置,
+                }
 
         已执行: set[str] = set()
+        实落序: list[str] = []
         for 段 in 序["执行序"]:
             装载序闸.校验段可执行(段, set(序["执行序"]), 已执行)
             载荷 = 体.get(段) or {}
             段执行[段](conn, 载荷, 装载日, 报, 新建)
             已执行.add(段)
+            实落序.append(段)
+
+        # 硬约束：实落段序必须与戳将记的执行序一致，禁止分叉。
+        if 实落序 != list(序["执行序"]):
+            raise 戳.戳违例(
+                f"实落段序{实落序}与裁定执行序{序['执行序']}分叉"
+            )
 
         conn.execute(
             "INSERT INTO 装载批次(编号, 装载日, 时刻, 报告) VALUES (?,?,?,?)",
             (批号, 装载日, 此刻(), json.dumps(报, ensure_ascii=False)),
         )
         _记序审计(conn, 批号, 装载日, 序, "成功", "", 0)
+        # 放行戳与成功审计、正式表同一事务同成败；落戳违例则整体回滚。
+        戳.落戳(conn, 批号, 序, 戳.放行)
         conn.commit()
+        # 提交后复核：禁止闸成功而戳空。
+        后置 = conn.execute(
+            "SELECT 结果 FROM 段序放行戳 WHERE 批号=?", (批号,)
+        ).fetchone()
+        if not 后置 or 后置["结果"] != 戳.放行:
+            raise 戳.戳违例(f"放行戳缺失或非放行：{批号}")
         return {
             "结果": "成功",
             "批次编号": 批号,
             "装载日": 装载日,
             "装载序": 序,
             "报告": 报,
+            "放行戳": {
+                "批号": 批号,
+                "原序": 序["原序"],
+                "执行序": 序["执行序"],
+                "拓扑版本": 戳.拓扑版本,
+                "结果": 戳.放行,
+            },
         }
     except Exception as e:
         conn.rollback()
         残留 = _残留(conn, 新建)
-        _记序审计(conn, 批号, 装载日, 序, "失败", str(e), 残留)
-        conn.execute(
-            "INSERT INTO 隔离匣(原因, 载荷, 时刻) VALUES (?,?,?)",
-            (str(e), json.dumps(体, ensure_ascii=False)[:2000], 此刻()),
-        )
-        conn.commit()
+        try:
+            _记序审计(conn, 批号, 装载日, 序, "失败", str(e), 残留)
+            conn.execute(
+                "INSERT INTO 隔离匣(原因, 载荷, 时刻) VALUES (?,?,?)",
+                (str(e), json.dumps(体, ensure_ascii=False)[:2000], 此刻()),
+            )
+            if not conn.execute(
+                "SELECT 1 FROM 段序放行戳 WHERE 批号=?", (批号,)
+            ).fetchone():
+                戳.落戳(conn, 批号, 序, 戳.拒绝, str(e))
+            conn.commit()
+        except Exception as 内:
+            conn.rollback()
+            raise 内 from e
         return {
             "结果": "失败",
             "批次编号": 批号,
